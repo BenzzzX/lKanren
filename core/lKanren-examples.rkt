@@ -1,0 +1,220 @@
+#lang slideshow
+(require pict/code)
+(require "lKanren.rkt")
+
+;test codes
+;utilities for debuging and simplifying code
+(define-syntax echo
+  (syntax-rules ()
+    ((_ f) (code f --> #,f))))
+
+(define-syntax r-let
+  (syntax-rules ()
+    ((_ ((x g) ...) f ...)
+     (r-exist (x ...) g ... f ...))))
+;basis
+(define r-#t (r-= #t #t))
+(define r-#f (r-= #f #t))
+(define r-else r-#t)
+
+;(cons a b) -> x
+(define (r-cons a b x)
+  (r-= (cons a b) x))
+(echo (cons 1 2))
+(echo (reduct* (x) in (r-cons 1 2 x)))
+(echo (reduct* (x) in (r-cons 1 x '(1 . 2))))
+
+;more basis
+;(car x) -> a
+(define (r-car x a)
+  (r-exist (b)
+         (r-cons a b x)))
+(echo (car '(1 . 2)))
+(echo (reduct* (x) in (r-car '(1 . 2) x)))
+       
+
+;(cdr x) -> b
+(define (r-cdr x b)
+  (r-exist (a)
+         (r-cons a b x)))
+
+;(null? x) -> #t
+(define (r-null? x)
+  (r-= x '()))
+
+;(pair? x) -> #t
+(define (r-pair? x)
+  (r-exist (a b)
+         (r-cons a b x)))
+
+
+
+;examples
+;some examples that just translate function into logic version
+(define (<=l a b)
+  (cond
+    [(and (null? a)
+          (null? b)) #t]
+    [(and (null? a)
+          (pair? b)) #t]
+    [(null? b) #f]
+    [else (let ((c (cdr a))
+                (d (cdr b)))
+            (<=l c d))]))
+
+;(<=l a b) ->#t 
+(define (r-<=l a b)
+  (r-cond
+   [(r-and (r-null? a)
+           (r-null? b)) r-#t]
+   [(r-and (r-null? a)
+           (r-pair? b)) r-#t]
+   [(r-null? b) r-#f]
+   [r-else (r-let ((c (r-cdr a c))
+                   (d (r-cdr b d)))
+                  (r-<=l c d))]))
+
+
+(define (reverse a)
+  (let iterator ((a a) (b '()))
+    (cond [(null? a) b]
+          [else (letrec ((c (cdr a))
+                         (d (car a))
+                         (e (cons d b)))
+                  (iterator c e))])))
+
+;(reverse a) -> x
+(define (r-reverse a x)
+  (let iterator ((a a) (b '()) (x x))
+    (r-cond [(r-null? a) (r-= x b)]
+            [r-else (r-let ((c (r-cdr a c))
+                            (d (r-car a d))
+                            (e (r-cons d b e)))
+                           (r-<=l e x)
+                           (iterator c e x))])))
+
+(echo (reverse '(1 2)))
+(echo (reduct* (x) in (r-reverse '(1 2) x)))
+(echo (reduct* (x) in (r-reverse x '(1 2))))
+
+(define (append a b)
+  (cond [(null? a) b]
+        [else (letrec ((c (car a))
+                       (d (cdr a))
+                       (y (append d b)))
+                (cons c y))]))
+
+;(append a b) -> x
+(define (r-append a b x)
+  (r-and (r-<=l a x) 
+         (r-cond [(r-null? a) (r-= x b)]
+                 [r-else (r-let ((c (r-car a c))
+                                 (d (r-cdr a d))
+                                 (y (r-append d b y)))
+                                (r-cons c y x))])))
+
+(echo (append '(1 2) '(3)))
+(echo (reduct* (x) in (r-append '(1 2) '(3) x)))
+(echo (reduct* (x y) in (r-append x y '(1 2 3))))
+
+
+;this example shows coding from different perspectives
+;we can easily translate code into logic version as we've done.
+(define (remove a b)
+  (let ((c (car a))
+        (d (cdr a)))
+    (cond
+      [(null? a) #f]
+      [(eq? c b) d]
+      [else (let ((y (remove d b)))
+              (cons c y))])))
+
+(define (r-remove a b x)
+  (r-let ((c (r-car a c))
+          (d (r-cdr a d)))
+         (r-<=l d x)
+         (r-cond
+          [(r-null? a) r-#f]
+          [(r-= c b) (r-= d x)]
+          [r-else (r-let ((y (r-remove d b y)))
+                         (r-cons c y x))])))
+
+(echo (remove '(1 2) 2))
+(echo (reduct* (x) in (r-remove '(1 2) 2 x)))
+(echo (reduct* (x) in (r-remove x 2 '(1))))
+(echo (reduct* (x y) in (r-remove '(1 2) x y)))
+
+;and we can also easily implement r-remove with r-append
+(define (r-remove* a b x)
+  (r-exist (c d e)
+         (r-cons b e d)
+         (r-<=l x a)
+         (r-append c e x)
+         (r-append c d a)))
+
+(echo (reduct* (x) in (r-remove* '(1 2) 2 x)))
+(echo (reduct* (x) in (r-remove* x 2 '(1))))
+(echo (reduct* (x y) in (r-remove* '(1 2) x y)))
+
+;the following example shows the possiblity of implementing the base math operations from scratch with
+;logic operators,to keep it simple,we pick number 0 and 1 to repersent boolean state
+(define (r-1 x) (r-= x 1))
+(define (r-0 x) (r-= x 0))
+(define (r-bit x)
+  (r-or (r-0 x) (r-1 x)))
+
+;simple truth table,logic gates can be implemented by using the same technique
+(define (r-full-adder a b c x y)
+  (r-cond [(r-0 a) (r-0 b) (r-0 c) (r-0 x) (r-0 y)]
+          [(r-0 a) (r-1 b) (r-0 c) (r-1 x) (r-0 y)]
+          [(r-1 a) (r-0 b) (r-0 c) (r-1 x) (r-0 y)]
+          [(r-1 a) (r-1 b) (r-0 c) (r-0 x) (r-1 y)]
+          [(r-0 a) (r-0 b) (r-1 c) (r-1 x) (r-0 y)]
+          [(r-0 a) (r-1 b) (r-1 c) (r-0 x) (r-1 y)]
+          [(r-1 a) (r-0 b) (r-1 c) (r-0 x) (r-1 y)]
+          [(r-1 a) (r-1 b) (r-1 c) (r-1 x) (r-1 y)]))
+
+;combine full-adders to adder
+(define (r-adder a b x y)
+  (let loop ((a a) (b b) (c 0) (x x))
+    (r-and
+     (r-<=l a x) (r-<=l b x)
+     (r-cond [(r-null? a)
+              (r-null? b)
+              (r-null? x)
+              (r-cons c '() y)]
+             [(r-exist (al ar bl br h i j)
+                     (r-cons al ar a)
+                     (r-cons bl br b)
+                     (r-full-adder al bl c h i)
+                     (loop ar br i j)
+                     (r-cons h j x))]))))
+
+;binary and decimal conversion
+(define (b2d b)
+  (let loop ((b b) (t 1))
+    (if (null? b) 0
+        (+ (* (car b) t) (loop (cdr b) (* t 2))))))
+
+(define (d2b d n)
+  (cons (remainder d 2)
+        (if (> n 1)
+            (d2b (quotient d 2) (- n 1)) '())))
+
+
+;tests
+
+(echo (map (lambda (l) (map b2d l))
+           (reduct* (x y) in (r-adder (d2b 2 3) (d2b 3 3) x y))))
+
+(echo (map (lambda (l) (map b2d l))
+           (reduct* (x y) in (r-adder x y (d2b 5 3) '(0)))))
+
+(define (r->= a b)
+  (r-exist (c)
+     (r-adder b c a '(0))))
+
+(echo (map (lambda (l) (map b2d l))
+           (reduct* (x) in (r->= (d2b 20 5) x))))
+  
+

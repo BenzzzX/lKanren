@@ -1,0 +1,465 @@
+#lang racket
+(require syntax/parse)
+(require (for-syntax syntax/parse))
+;core
+(define-syntax-rule (var x) (vector (quote x)))
+
+(define (var? x) (vector? x))
+
+(define (extend x y graph)
+  `((,x . ,y) . ,graph))
+
+(define (walk var graph)
+  (if (var? var)
+      (let ((value (assq var graph)))
+        (if value
+            (walk (cdr value) graph)
+            var))
+      var))
+
+(define (unify a b graph)
+  (if (not graph) #f
+      (let ((a (walk a graph))
+            (b (walk b graph)))
+        (cond
+          [(eq? a b) graph]
+          [(var? a) (extend a b graph)]
+          [(var? b) (extend b a graph)]
+          [(and (pair? b) (pair? a))
+           (unify (cdr a) (cdr b)
+             (unify (car a) (car b) graph))]
+          [else #f]))))
+
+
+(define-syntax lazy; create lazy tail
+  (syntax-rules ()
+    [(_ f) (λ (env)
+             (λ () (f env)))]))
+
+(define (s-merge stream1 stream2); merge stream (logic or)
+  (cond
+    [(null? stream1) stream2]
+    [(procedure? stream1) (λ () (s-merge stream2 (stream1)))]; lazy carry
+    [else (cons (car stream1) (s-merge (cdr stream1) stream2))]))
+
+(define (s-map stream relation); fliter stream (logic and)
+  (cond
+    [(null? stream) '()]
+    [(procedure? stream) (λ () (s-map (stream) relation))]; lazy carry
+    [else (s-merge (relation (car stream)) (s-map (cdr stream) relation))]))
+
+(define (cuta stream1 stream2)
+  (cond
+    [(null? stream1) stream2]
+    [(procedure? stream1) (λ () (cuta (stream1) stream2))]
+    [else stream1]))
+
+(define (cutj relation1 relation2)
+  (λ (env) (cuta (relation1 env) (relation2 env))))
+
+(define (disj relation1 relation2); or
+  (λ (env) (s-merge (relation1 env) (relation2 env))))
+
+(define (conj relation1 relation2); and
+  (λ (env) (s-map (relation1 env) relation2)))
+ 
+;reduction
+(define (inst-name n symbol)
+  (string->symbol
+   (string-append symbol (number->string n))))
+
+(define (walk* var env)
+  (let ((var (walk var env)))
+    (if (pair? var)
+        (cons (walk* (car var) env)
+              (walk* (cdr var) env))
+        var)))
+
+(define (bounded? l)
+  (cond [(var? l) #f]
+        [(pair? l) (and (bounded? (car l))
+                        (bounded? (cdr l)))]
+        [else #t]))
+
+(define (inst x graph symble)
+  (walk* x
+   (let inst-env ((x x) (env '()))
+     (let ((x (walk x graph)))
+       (cond
+         ((var? x)
+          (extend x (inst-name (length env) symble) env))
+         ((pair? x) (inst-env (cdr x)
+                              (inst-env (car x) env)))
+         (else env))))))
+
+
+(define (combine x ex)
+  (apply append (map (lambda (a b)
+                       (list (string->symbol
+                              (string-append
+                               (symbol->string (vector-ref a 0)) ":"))
+                             b)) x ex)))
+
+(define (de-duplication x)
+  (cond [(null? x) '()]
+        [(memq (car x) (cdr x))
+         (de-duplication (cdr x))]
+        [else (cons (car x) (de-duplication (cdr x)))]))
+
+(define (inst* x env)
+  (let* ((x (de-duplication x))
+          (fixed (walk* x (car env)))
+          (excepts (if (bounded? fixed) '()
+                      (inst-=/= x fixed (cdr env)))))
+    (if (null? excepts) (combine x (inst fixed (car env) "?"))
+        (cons (combine x (inst fixed (car env) "?"))
+              (cons 'except excepts)))))
+
+(define (inst-=/= o x graphs)
+  (if (null? graphs) '()
+      (let ((fixed (walk* x (car graphs))))
+        (if (eq? fixed x)
+            (inst-=/= x (cdr graphs))
+            (cons (combine o (inst fixed (car graphs) "!")) (inst-=/= x (cdr graphs)))))))
+
+(define (pull stream)
+  (if (procedure? stream)
+      (pull (stream))
+      stream))
+
+(define (pull* stream)
+  (let ((h (pull stream)))
+    (if (null? h) '()
+        (cons (car h) (pull* (cdr h))))))
+
+(define (pulln n stream)
+  (if (zero? n) '()
+      (let ((h (pull stream)))
+        (if (null? h) '()
+            (cons (car h) (pulln (- n 1) (cdr h)))))))
+;interfaces
+
+
+(define (== a b)
+  (λ (env)
+    (==-verify (unify a b (car env)) env)))
+
+(define (==-verify graph env)
+  (cond [(not graph) '()] ; not equal,fail
+        [(eq? graph (car env)) (list env)] ; equal,succeed,do nothing
+        [(verify-=/= (cdr env) '() graph)
+         => (λ (g) (list (cons graph g)))]
+        [else '()]))
+
+(define (verify-=/= gs gs* graph)
+  (cond [(null? gs) gs*]
+        [(unify* (car gs) graph); try to expand not equal relation
+         => (λ (g)
+              (cond
+                [(eq? graph g) #f]; equal,fail
+                (else (let ((c (prefix-s g graph))); otherwise,take new relation to
+                        (verify-=/= (cdr gs) (cons c gs*) graph)))))]; expand disequal relation
+        [else (verify-=/= (cdr gs) gs* graph)])); if now it's surely disequal
+                                             ; remove the disequal relation
+  
+(define (unify* l graph)
+  (cond [(null? l) graph]
+        [(unify (car (car l))
+                (cdr (car l)) graph)
+         => (λ (g) (unify* (cdr l) g))]
+        {else #f}))
+
+(define (=/= a b)
+  (λ (env)
+    (=/=-verify (unify a b (car env)) env))) ;reuse unify
+
+(define (=/=-verify graph env)
+  (cond [(not graph) (list env)] ; not equal,succeed,do nothing
+        [(eq? graph (car env)) '()] ; equal,fail
+        [else (let ((c (prefix-s graph (car env)))) ; otherwise,take new relation
+                (list (cons (car env)               ; into disequal relation
+                            (cons c (cdr env)))))]))
+
+(define (prefix-s new-graph graph)
+  (if (eq? new-graph graph) '()
+      (cons (car new-graph)
+            (prefix-s (cdr new-graph) graph))))
+                
+
+(define-syntax exist
+  (syntax-rules ()
+    [(_ (x ...) f)
+     (let ((x (var x)) ...)  f)]))
+
+(define-syntax exist*
+  (syntax-rules ()
+    [(_ (x ...) f ...)
+     (let ((x (var x)) ...)  (ando f ...))]))
+
+(define-syntax ando
+  (syntax-rules ()
+    [(_ f) (lazy f)]
+    [(_ f t ...)
+     (conj (lazy f) (ando t ...))]))
+
+(define-syntax oro
+  (syntax-rules ()
+    [(_ f) (lazy f)]
+    [(_ f t ...)
+     (disj (lazy f) (oro t ...))]))
+
+(define (fail env) '())
+
+(define-syntax condo
+  (syntax-rules ()
+    [(_ [a ...] ...)
+     (oro (ando a ...) ...)]
+    [(_) (lazy fail)]))
+
+(define-syntax conda
+  (syntax-rules ()
+    [(_ [a ...] b ...)
+     (cutj (ando a ...)
+           (conda b ...))]
+    [(_) (lazy fail)]))
+
+(define-syntax ifo
+  (syntax-rules ()
+    ((_ cond true false)
+     (condo [cond true]
+             [!#t false]))))
+
+(define-syntax ifa
+  (syntax-rules ()
+    ((_ cond true false)
+     (conda [cond true]
+              [!#t false]))))
+
+(define (conso a b x)
+  (== x `(,a . ,b)))
+(define (caro x a)
+  (exist (b)
+    (conso a b x)))
+(define (cdro x a)
+  (exist (b)
+    (conso b a x)))
+(define (null?o x)
+  (== x '()))
+(define (pair?o x)
+  (exist (a b)
+    (conso a b x)))
+
+(define (appendo a b x)
+  (matcho a
+    ['() (== x b)]
+    [(h . t)
+     (exist* (y)
+       (conso h y x)
+       (appendo t b y))]))
+       
+
+
+
+(define-syntax β
+  (syntax-rules (-> guard)
+    [(_ (arg . args) -> y guard f body ...)
+     (λ ($k arg . args) (exist (y) (ando ($k y) f (cps (begin body ...) $k))))]
+    [(_ arg -> y guard f body ...)
+     (λ ($k arg) (exist (y) (ando ($k y) f (cps (begin body ...) $k))))]
+    [(_ (arg . args) -> y body ...)
+     (λ ($k arg . args) (exist (y) (ando ($k y) (cps (begin body ...) $k))))]
+    [(_ arg -> y body ...)
+     (λ ($k arg) (exist (y) (ando ($k y) (cps (begin body ...) $k))))]))
+
+
+(define-syntax !define
+  (syntax-rules (-> guard)
+    [(_ (name . args) -> y guard f body ...)
+     (define name (β args -> y guard f body ...))]
+    [(_ (name . args) -> y body ...)
+     (define name (β args -> y body ...))]))
+
+(define !#t (== #t #t))
+(define !#f (== #f #t))
+(define (!cons cont x y)
+  (exist* (a)
+         (== `(,x . ,y) a)
+         (cont a)))
+
+(define (!car cont a)
+  (exist* (x y)
+         (== `(,x . ,y) a)
+         (cont x)))
+
+(define (!cdr cont a)
+  (exist* (x y)
+         (== `(,x . ,y) a)
+         (cont y)))
+
+(define (l<=o x y)
+  (matcho `(,x ,y)
+    [('() _)]
+    [((a . b) (c . d))
+     (l<=o b d)]))
+(!define (!append-aux a b) -> x guard (l<=o a x)
+  (match `(,a ,b)
+    [('() (h . t)) (!append-aux h t)]
+    [(_ '()) a]
+    [((h . t) (x . y))
+     (!cons h (!append-aux t b))]))
+(!define (!append a . b) -> x
+  (!append-aux a b))
+
+
+(define-syntax solve*
+  (syntax-rules ()
+    [(_ (f args ...) -> y)
+     (expand (y args ...)
+       (map (λ (env) (inst* (split y args ...) env))
+            (let ((cont (λ ($k) (== $k y))))
+              (pull* ((f cont args ...) '(() . ()))))))]
+    [(_ (prim args ...))
+     (expand (args ...)
+        (map (λ (env) (inst* (split args ...) env))
+             (pull* ((prim args ...) '(() . ())))))]))
+
+(define-syntax solve
+  (syntax-rules ()
+    [(_ n (f args ...) -> y)
+     (expand (y args ...)
+       (map (λ (env) (inst* (split y args ...) env))
+            (let ((cont (λ ($k) (== $k y))))
+              (pull* ((f cont args ...) '(() . ()))))))]
+    [(_ n (prim args ...))
+     (expand (args ...)
+        (map (λ (env) (inst* (split args ...) env))
+             (pull n ((prim args ...) '(() . ())))))]))
+
+
+
+(define-syntax (expand expr)
+  (syntax-parse expr
+    [(_ () expr) #'expr]
+    [(_ (v:id vs ...) expr)
+     #'(let ((v (var v)))
+       (expand (vs ...) expr))]
+    [(_ (_ vs ...) expr) #'(expand (vs ...) expr)]))
+
+(define-syntax (split expr)
+  (syntax-parse expr
+    #:literals (unquote)
+    [(_) #''()]
+    [(_ v:id vs ...)
+     #'(cons v
+       (split vs ...))]
+    [(_ _ vs ...) #'(split vs ...)]))
+
+(define-syntax (parseo expr)
+  (define-syntax-class ellipsis
+    #:description "ellipsis"
+    #:literals (...)
+    (pattern ...))
+  (syntax-parse expr
+    #:literals (quote unquote)
+    [(_ v () t ...) #'(ando (== v '()) t ...)]
+    [(_ v (unquote var) t ...) #'(ando (== v var) t ...)]
+    [(_ v (quote lit) t ...) #'(ando (== v (quote lit)) t ...)]
+    [(_ v (l e:ellipsis . r) t ...)
+     #'(exist* (vl vr)
+         (appendo vl vr v)
+         (parseo vl l
+             (parseo vr r t ...)))]
+    [(_ v var:id t ...) #'(exist* (var) (== v var) t ...)]
+    [(_ v (l . r) t ...); split pair
+     #'(exist* (vl vr)
+         (== v `(,vl . ,vr))
+         (parseo vl l (parseo vr r t ...)))]
+    [(_ v var:id t ...) #'(exist* (var x) (== v var) t ...)]
+    [(_ v _ t ts ...) #'(ando t ts ...)]; wildcard , match evetything
+    [(_ v a t ...) #'(ando (== v a) t ...)]))
+    
+
+(define-syntax matcho
+  (syntax-rules ()
+    [(_ v [p t ...]) (parseo v p t ...)]
+    [(_ v [p t ...] g ...)
+     (disj (lazy (parseo v p t ...))
+           (matcho v g ...))]))
+
+(define-syntax cps-args
+  (syntax-rules ()
+    [(_ () cont) (cont '())]
+    [(_ (arg args ...) cont)
+     (cps arg (λ (hd)
+                (cps-args (args ...) (λ (tl)
+                                       (cont (cons hd tl))))))]))
+
+(define-syntax (cps-quasiquote expr)
+  (define-syntax-class atom
+    #:description "atom"
+    (pattern (~or :id :boolean :str :char :number :integer)))
+  (syntax-parse expr
+    #:literals (quote unquote)
+    [(_ ()) #''()]
+    [(_ (unquote k)) #'(cps k (λ ($k) $k))]
+    [(_ (quote k)) #'(quote k)]
+    [(_ ((unquote k) . t))
+     #'(cps k (λ ($k)
+                (cons $k (cps-quasiquote t))))]
+    [(_ ((quote k) . t))
+     #'(cons (quote k) (cps-quasiquote t))]
+    [(_ (k . t))
+     #'(cons (cps-quasiquote k) (cps-quasiquote t))]
+    [(_ k) #'(quote k)]))
+    
+           
+
+(define-syntax (cps expr)
+  (define-literal-set keywords
+    (λ begin quote let and or define if
+      else cond match quasiquote apply))
+  (define-syntax-class atom
+    #:description "atom"
+    (pattern (~or :id :boolean :str :char :number :integer)))
+  (syntax-parse expr
+    #:literal-sets (keywords)
+    [(_ x:atom cont) #'(cont x)]
+    [(_ (begin expr) cont) #'(cps expr cont)]
+    [(_ (begin expr exprs ...) cont)
+     #'(cps expr (λ ($k) (conj (lazy $k) (lazy (cps (begin exprs ...) cont)))))]
+    [(_ (if exprc exprt exprf) cont)
+     #'(ifo exprc
+            (cps exprt (λ ($k) (cont $k)))
+            (cps exprf (λ ($k) (cont $k))))]
+    [(_ (quote expr) cont) #'(cont (quote expr))]
+    [(_ (quasiquote expr) cont)
+     #'(cont (cps-quasiquote expr))]
+    [(_ (let ([vs as] ...) body ...) cont)
+     #'(exist (vs ...)
+         (cps (begin (define vs as) ... body ...) cont))]
+    [(_ (λ (arg . args) body ...) cont)
+     #'(cont (λ ($k arg . args) (cps (begin body ...) $k)))]
+    [(_ (λ arg body ...) cont)
+     #'(cont (λ ($k arg) (cps (begin body ...) $k)))]
+    [(_ (define id expr) cont) #'(== id expr)]
+    [(_ (cond [else body ...]) cont)
+     #'(cps (begin body ...) cont)]
+    [(_ (cond [c body ...]) cont)
+     #'(conj (lazy c) (lazy (cps (begin body ...)) cont))]
+    [(_ (cond [c body ...] t ...) cont)
+     #'(disj (lazy (conj (lazy c) (cps (begin body ...) cont))) (lazy (cps (cond t ...) cont)))]
+    [(_ (match v [p t ...] ...) cont)
+     #'(cps v (λ ($k) (matcho $k [p (cps (begin t ...) cont)] ...)))]
+    [(_ (f args ...) cont)
+     #'(cps f (λ ($f)
+                (cps-args (args ...)
+                   (λ ($k)
+                     (apply $f (cons cont $k))))))]))
+
+
+
+(provide == =/= exist exist* ando oro condo conda solve* solve parseo matcho
+         conso caro cdro null?o pair?o l<=o appendo
+         !car !cdr ifo ifa !cons !append !#f !#t β !define)
+
+
